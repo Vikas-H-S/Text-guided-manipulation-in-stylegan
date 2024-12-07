@@ -1,117 +1,126 @@
 import os
 import yaml
 import numpy as np
-
 import torch
 from models.stylegan2.models import Generator
-
 from tqdm import tqdm
 from pathlib import Path
-from manipulation_model import GlobalDirection
+from manipulation_model import GlobalManipulator
 import argparse
 from matplotlib import pyplot as plt
-
 from torchvision.utils import save_image
 
-def convert(img, target_type_min, target_type_max, target_type):
-    imin = img.min()
-    imax = img.max()
+def rescale_image(image, new_min, new_max, target_dtype):
+    original_min = image.min()
+    original_max = image.max()
 
-    a = (target_type_max - target_type_min) / (imax - imin)
-    b = target_type_max - a * imax
-    new_img = (a * img + b).astype(target_type)
-    return new_img
+    scale_factor = (new_max - new_min) / (original_max - original_min)
+    offset = new_max - scale_factor * original_max
+    rescaled_image = (scale_factor * image + offset).astype(target_dtype)
+    return rescaled_image
 
-def manip_single_pair(model, target, dictionary='single'):
-    if dictionary=='single': # StyleCLIP Global Direction
-        img_gen, manipulation_dir, *_ = model.manipulate_image(target=target, file_name=None)
-    elif dictionary=='multi': # Multi2One
-        img_gen, manipulation_dir, *_ = model.manipulate_image(target=target, file_name=Path(config['stylespace_path'])/'multi2one.pt')
+def process_single_target(model, target_class, direction_type='single'):
+    if direction_type == 'single':
+        generated_image, direction_vector, *_ = model.modify_image(target=target_class, output_file=None)
+    elif direction_type == 'multi':
+        generated_image, direction_vector, *_ = model.modify_image(
+            target=target_class, 
+            output_file=Path(config['style_space_path']) / 'multi2one.pt'
+        )
     else:
-        NotImplementedError('dictionary should be either single or multi')
+        raise NotImplementedError("direction_type must be either 'single' or 'multi'")
     return {
-        'manipulated_image': img_gen.detach().cpu(), # torch.tensor
-        'manipulation_dir': manipulation_dir, # numpy.array
+        'modified_image': generated_image.detach().cpu(),
+        'direction_vector': direction_vector,
     }
 
-def manipulate(target, latent):
+def apply_modifications(target_classes, latent_code):
+    settings = {
+        'generator_model': generator,
+        'latent_code': latent_code,
+    }
+    settings.update(config)
 
-    opts = {
-            'generator': generator,
-            'latent': latent,
-        }
+    manipulator = GlobalManipulator(**settings)
+    manipulated_images = []
 
-    opts.update(config)
-    model = GlobalDirection(**opts)
-    all_images = []
-    for t in tqdm(target):
+    for target_class in tqdm(target_classes):
         with torch.no_grad():
-            styleclip_output = manip_single_pair(model, t, 'single')
-            multi2one_output = manip_single_pair(model, t, 'multi')
+            single_direction_output = process_single_target(manipulator, target_class, 'single')
+            multi_direction_output = process_single_target(manipulator, target_class, 'multi')
             
-            imgs = [model.img_orig.detach().cpu(), styleclip_output['manipulated_image'], multi2one_output['manipulated_image']]
-        manip_img = torch.cat(imgs, dim=-1).squeeze(0).permute(1, 2, 0)
-        all_images.append(np.asarray(manip_img))
-        
-
-    save_name = os.path.join('./logs', config['dataset'] + '.png')
-    nrows = int(len(target) / 2)
-    fig, axs = plt.subplots(nrows=nrows, ncols=2, figsize=(6, 4), constrained_layout=True)  # Use constrained_layout=True
-    for i, img in enumerate(all_images):
-        c_idx = i % 2
-        r_idx = int(i / 2)
-        img = convert(img, 0, 255, np.uint8)
-        axs[r_idx, c_idx].imshow(img)
-        axs[r_idx, c_idx].set_title('Original     |     StyleCLIP     |     Multi2One', fontsize=7, pad=1.5)
-        axs[r_idx, c_idx].set_xlabel(target[i], fontsize=9)
-        axs[r_idx, c_idx].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+            images_set = [
+                manipulator.original_image.detach().cpu(), 
+                single_direction_output['modified_image'], 
+                multi_direction_output['modified_image']
+            ]
+        concatenated_images = torch.cat(images_set, dim=-1).squeeze(0).permute(1, 2, 0)
+        manipulated_images.append(np.asarray(concatenated_images))
     
-    plt.savefig(save_name, dpi=1000)
-    print(f"saved manipulated image at {save_name}")
+    save_path = os.path.join('./logs', config['dataset'] + '.png')
+    num_rows = len(target_classes) // 2
+    fig, axes = plt.subplots(nrows=num_rows, ncols=2, figsize=(6, 4), constrained_layout=True)
+    
+    for idx, image in enumerate(manipulated_images):
+        column_index = idx % 2
+        row_index = idx // 2
+        image = rescale_image(image, 0, 255, np.uint8)
+        axes[row_index, column_index].imshow(image)
+        axes[row_index, column_index].set_title(
+            'Original | StyleCLIP | Multi2One', fontsize=7, pad=1.5
+        )
+        axes[row_index, column_index].set_xlabel(target_classes[idx], fontsize=9)
+        axes[row_index, column_index].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+    
+    plt.savefig(save_path, dpi=1000)
+    print(f"Manipulated image saved at {save_path}")
     plt.cla()
-    
-    
 
-if __name__=="__main__":
-    parser = argparse.ArgumentParser(description='Configuration for styleCLIP Global Direction with our method')
-    parser.add_argument("--dataset", type=str, default="ffhq",    choices=['ffhq', 'afhqcat', 'afhqdog', 'car', 'church'],  help="name of stylegan pretrained dataset")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Configuration for StyleCLIP Global Manipulation Method')
+    parser.add_argument(
+        "--dataset", 
+        type=str, 
+        default="ffhq", 
+        choices=['ffhq', 'afhqcat', 'afhqdog', 'car', 'church'], 
+        help="Specify the StyleGAN pretrained dataset"
+    )
     args = parser.parse_args()
-
-    # https://drive.google.com/uc?
 
     if not os.path.exists('Pretrained'):
         import gdown
-        zipfile_path = 'https://drive.google.com/uc?export=download&id=1wkCJxUf7YD-ov70DCZaN8GRUoKsKZJOs'
-        output_name = 'multi2one.zip'
-        gdown.download(zipfile_path, output_name, quiet=False)
-        os.system(f'unzip {output_name}; rm {output_name}; mv tmp/* .; rm -r tmp')
+        zip_url = 'https://drive.google.com/uc?export=download&id=1wkCJxUf7YD-ov70DCZaN8GRUoKsKZJOs'
+        downloaded_zip = 'multi2one.zip'
+        gdown.download(zip_url, downloaded_zip, quiet=False)
+        os.system(f'unzip {downloaded_zip}; rm {downloaded_zip}; mv tmp/* .; rm -r tmp')
 
-    with open('config.yaml', "r") as f:
-        config = yaml.safe_load(f)
+    with open('config.yaml', "r") as file:
+        config = yaml.safe_load(file)
         config = config[f"{args.dataset}_params"]
     
     device = torch.device("cuda:0" if torch.cuda.is_available() else 'cpu')
     
     generator = Generator(
-        size = config['stylegan_size'],
-        style_dim = 512,
-        n_mlp = 8,
-        channel_multiplier = 2,
+        size=config['stylegan_size'],
+        style_dim=512,
+        n_mlp=8,
+        channel_multiplier=2,
     )
-    
     generator.load_state_dict(torch.load(config['stylegan_ckpt'], map_location='cpu')['g_ema'])
     generator.eval()
     generator.to(device)
    
-    name = f'dictionary/{args.dataset}/latent.pt'
-    if os.path.exists(name):
-        latent = torch.load(name, map_location='cpu').to(device)
+    latent_file = f'dictionary/{args.dataset}/latent.pt'
+    if os.path.exists(latent_file):
+        latent_code = torch.load(latent_file, map_location='cpu').to(device)
     else:
-        mean_latent = generator.mean_latent(4096)
-        latent_code_init_not_trunc = torch.randn(1, 512).cuda()
+        mean_latent_vector = generator.mean_latent(4096)
+        initial_latent = torch.randn(1, 512).cuda()
         with torch.no_grad():
-            _, latent = generator([latent_code_init_not_trunc], return_latents=True,
-                                        truncation=0.7, truncation_latent=mean_latent)
-
-    
-    manipulate(config['targets'], latent)
+            _, latent_code = generator(
+                [initial_latent], 
+                return_latents=True, 
+                truncation=0.7, 
+                truncation_latent=mean_latent_vector
+            )
+    apply_modifications(config['targets'], latent_code)
